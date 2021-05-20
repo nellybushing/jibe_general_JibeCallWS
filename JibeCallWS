@@ -1,0 +1,784 @@
+package JibeCallWS
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"strings"
+	"text/template"
+
+	"https://drive.google.com/file/d/1of7PE3ZM0_O3sA19UVi09sfi_ho7uIwm/view?usp=sharing"
+
+	"golang.org/x/net/html"
+
+	"github.com/sethgrid/pester"
+)
+
+const packageName = "JibeCallWS"
+const copyright = "Copyright © 2018 Jibe Consulting, Inc.; All Rights Reserved."
+
+var (
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+)
+
+// JibeCallWS calls a web service, and returns the results.  There are many options:
+//
+// Parameters:
+// 1: args: command-line arguments, strings of format "key=value".
+//
+//	endpoint={request url}
+//	soapaction={SOAP action in HTML header}
+//	infile={file that contains HTML request}
+//	infiletemplate={true|false}
+//	flattenHTML={true|false}
+//	flattenXML={true|false}
+//	flattenKey={flat key to search for}
+//	outfile={file to write HTML response}
+//	base64={true|false} perform base64 decrypt on output file
+//	Options for HTML Basic Authentication:
+//	authtype={basic} username={username} password={password}
+//
+// 2: argin: will be read instead of os.Stdin
+// 3: argout: will be written to instead of os.Stdout
+// 4: argerr: will be written to instead of os.Stderr
+//
+// Return values:
+// 1: []byte: raw data returned by web service call.
+// 2: []byte: data after any processing by JibeCallWS.
+// 3: *http.Response: the response from the web service call.
+//    Check resp.Status or resp.StatusCode to determine success of failure of call.
+// 4: error: any errors encrountered.
+//
+func JibeCallWS(args []string, argin io.Reader, argout io.Writer, argerr io.Writer) ([]byte, []byte, *http.Response, error) {
+
+	const funcName = "JibeCallWS"
+
+	var err error
+
+	// Save readers/writers in package variables
+	stdin = argin
+	stdout = argout
+	stderr = argerr
+
+	// create an empty context
+	var ctx context.Context
+	ctx = context.Background()
+
+	// Parse the command-line args
+	ctx, err = processArgs(ctx, args)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// do cpu profiling if requested
+	var fcpuprofile *os.File
+	var ncpuprofile string
+	ncpuprofile = ValueCache.GetContextStringValueMust(ctx, "cpuprofile")
+	if ncpuprofile != "" {
+		fcpuprofile, err = os.Create(ncpuprofile)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		defer pprof.StopCPUProfile()
+		pprof.StartCPUProfile(fcpuprofile)
+	}
+
+	// get the input file (the SOAP request)
+	var requestBody []byte
+
+	var stringInfile string
+	stringInfile = ValueCache.GetContextStringValueMust(ctx, "infile")
+	if stringInfile != "" { // input comes from file
+		requestBody, err = ioutil.ReadFile(stringInfile)
+		if err != nil {
+			return nil, nil, nil, errors.New(packageName + ": " + funcName + ": " + err.Error())
+		}
+	} else { // input comes from stdin
+		requestBody, err = ioutil.ReadAll(stdin)
+		if err != nil {
+			return nil, nil, nil, errors.New(packageName + ": " + funcName + ": " + err.Error())
+		}
+	}
+
+	var strRequestBody string
+	strRequestBody = string(requestBody)
+
+	// if infile is a template, do the template processing
+	if ValueCache.GetContextBoolValueMust(ctx, "infiletemplate") {
+
+		if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+			fmt.Fprintf(stderr, "infile BEFORE template processing:\n%s\n\n", strRequestBody)
+		}
+
+		strRequestBody, err = processTemplate(strRequestBody)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+			fmt.Fprintf(stderr, "infile AFTER template processing:\n%s\n\n", strRequestBody)
+		}
+
+	}
+
+	var requestLength int
+	requestLength = len(strRequestBody)
+
+	var stringEndpoint string
+	stringEndpoint = ValueCache.GetContextStringValueMust(ctx, "endpoint")
+
+	var u *url.URL
+	u, err = url.Parse(stringEndpoint)
+	if err != nil {
+		return nil, nil, nil, errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	var req *http.Request
+	req, err = http.NewRequest("POST", stringEndpoint, strings.NewReader(strRequestBody))
+	req.Method = "POST"
+	if err != nil {
+		return nil, nil, nil, errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	// Don't accept gzip or deflate.  We won't need to uncompress.
+	// req.Header.Add("Accept-Encoding", "gzip,deflate")
+	req.Header.Add("Accept-Encoding", "")
+	req.Header.Add("Content-Type", "text/xml;charset=UTF-8")
+	req.Header.Add("SOAPAction", `"`+ValueCache.GetContextStringValueMust(ctx, "soapaction")+`"`)
+	req.Header.Add("Content-Length", strconv.Itoa(requestLength))
+	req.Header.Add("Host", u.Host)
+	req.Header.Add("Connection", "Keep-Alive")
+	if strings.Compare(ValueCache.GetContextStringValueMust(ctx, "authtype"), "basic") == 0 {
+		req.SetBasicAuth(ValueCache.GetContextStringValueMust(ctx, "username"), ValueCache.GetContextStringValueMust(ctx, "password"))
+	}
+
+	if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+		dumpHTTPRequest(req, stderr)
+	}
+
+        // resilience courtesy of https://github.com/sethgrid/pester
+        // control the resiliency
+        client := pester.New()
+        client.Concurrency = 1
+        client.MaxRetries = 10
+        client.Backoff = pester.ExponentialJitterBackoff
+        client.KeepLog = true
+
+	var resp *http.Response
+        resp, err = client.Do(req)
+
+        // return the log information about retries
+        if client.LogErrCount() > 0 {
+                fmt.Fprintf(os.Stderr, client.LogString())
+        }
+
+	if err != nil {
+		return nil, nil, nil, errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+	// close the body; it is supposed to make the existing connection reusable.
+	defer resp.Body.Close()
+
+	// output response details
+	if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+		dumpHTTPResponse(resp, stderr)
+	}
+
+	// raw holds the raw results from web service call
+	var raw []byte
+	raw, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, resp, errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+		fmt.Fprintf(stderr, "resp.Body: ")
+		_, err = io.Copy(stderr, bytes.NewReader(raw))
+		fmt.Fprintf(stderr, "\n")
+	}
+
+	var data []byte
+	var lookFor string
+
+	// using data for processed results
+	data = make([]byte, len(raw))
+	copy(data, raw)
+
+	if ValueCache.GetContextBoolValueMust(ctx, "base64") {
+		lookFor = stringBetween(string(data), "<reportBytes>", "</reportBytes>")
+		if lookFor != "" {
+			data, err = base64.StdEncoding.DecodeString(lookFor)
+			if err != nil {
+				return raw, data, resp, errors.New(packageName + ": " + funcName + ": " + err.Error())
+			}
+
+		}
+		if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+			fmt.Fprintf(stderr, "after base64 decode: ")
+			_, err = io.Copy(stderr, bytes.NewReader(data))
+			fmt.Fprintf(stderr, "\n")
+		}
+	}
+
+	var outerr error
+	var buf bytes.Buffer
+	var haveBytes, copiedBytes int64
+
+	// capture processed results in a buffer
+	if ValueCache.GetContextBoolValueMust(ctx, "flattenXML") {
+		outerr = flattenXml( &buf, bytes.NewReader(data), ValueCache.GetContextStringValueMust(ctx, "flattenKey"))
+	} else if ValueCache.GetContextBoolValueMust(ctx, "flattenHTML") {
+		outerr = flattenHtml( &buf, bytes.NewReader(data), ValueCache.GetContextStringValueMust(ctx, "flattenKey"))
+	} else {
+		haveBytes = int64(len(data))
+		copiedBytes, outerr = io.Copy(&buf, bytes.NewReader(data))
+		if outerr == nil && ( copiedBytes != haveBytes ) {
+			outerr = fmt.Errorf("copy failed; copied %d of %d bytes\n", copiedBytes, haveBytes)
+		}
+	}
+
+	if outerr != nil {
+		return raw, data, resp, errors.New(packageName + ": " + funcName + ": " + outerr.Error())
+	}
+
+	outbuf := buf.Bytes()
+
+	// outbuf now holds the processed results
+
+	if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+		fmt.Fprintf(stderr, "outbuf: ")
+		_, err = io.Copy(stderr, bytes.NewReader(outbuf))
+		fmt.Fprintf(stderr, "\n")
+	}
+
+	// write results to output device
+	var stringOutfile string
+	stringOutfile = ValueCache.GetContextStringValueMust(ctx, "outfile")
+
+	if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+		fmt.Fprintf(stderr, "stringOutfile: %s\n", stringOutfile)
+	}
+
+	// declaration moved here to avoid:
+	// JibeCallWS.go:250: goto MemProfile jumps over declaration of f at JibeCallWS.go:258
+	var f *os.File
+
+	// if no output file specified, write to stdout
+	if stringOutfile == "" {
+		if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+			fmt.Fprintf(stderr, "writing output to stdout\n")
+		}
+		_, err = io.Copy(stdout, bytes.NewReader(outbuf))
+		if err != nil {
+			return raw, outbuf, resp, errors.New(packageName + ": " + funcName + ": " + err.Error())
+		}
+		goto MemProfile
+	}
+
+	// caller specified an output file
+	if ValueCache.GetContextBoolValueMust(ctx, "debug") {
+		fmt.Fprintf(stderr, "writing output to outfile: %s\n", stringOutfile)
+	}
+
+	f, err = os.OpenFile(stringOutfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return raw, outbuf, resp, errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+	defer f.Close()
+
+	_, err = io.Copy(f, bytes.NewReader(outbuf))
+	if err != nil {
+		return raw, outbuf, resp, errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+MemProfile:
+	// do memory profiling if requested
+	var fmemprofile *os.File
+	var nmemprofile string
+	nmemprofile = ValueCache.GetContextStringValueMust(ctx, "memprofile")
+	if nmemprofile != "" {
+		fmemprofile, err = os.Create(nmemprofile)
+		if err != nil {
+			return raw, outbuf, resp, nil
+		}
+		defer fmemprofile.Close()
+		runtime.GC() // get up-to-date statistics
+		pprof.WriteHeapProfile(fmemprofile)
+	}
+
+	return raw, outbuf, resp, nil
+
+}
+
+func processTemplate(instr string) (string, error) {
+
+	const funcName = "processTemplate"
+
+	var err error
+	var tmpl *template.Template
+	tmpl, err = template.New("infile").Funcs(template.FuncMap{
+		"oscmd": func(args ...string) (string, error) {
+			var err error
+			var buf *bytes.Buffer
+			buf = new(bytes.Buffer)
+			err = launch(args, stdin, buf, stderr)
+			if err != nil {
+				return "", err
+			}
+			return buf.String(), nil
+		},
+		"splitAtEOL": func(args ...string) []string {
+			var ret []string
+			for _, arg := range args {
+				ret = append(ret, strings.Split(arg, "\n")...)
+			}
+			return ret
+		},
+		"getenv": func(args ...string) string {
+			var ret string
+			for _, arg := range args {
+				ret = os.Getenv(arg)
+				break
+			}
+			return ret
+		},
+		"getenvs": func(args ...string) []string {
+			var ret []string
+			for _, arg := range args {
+				ret = append(ret, os.Getenv(arg))
+			}
+			return ret
+		},
+	}).Parse(instr)
+	if err != nil {
+		return "", errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	var buf *bytes.Buffer
+	buf = new(bytes.Buffer)
+
+	err = tmpl.Execute(buf, nil)
+	if err != nil {
+		return "", errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	var outstr string
+	outstr = buf.String()
+
+	return outstr, nil
+
+}
+
+func dumpHTTPRequest(req *http.Request, w io.Writer) {
+
+	const funcName = "dumpHTTPRequest"
+
+	fmt.Fprintf(w, "req.Method: %s\n", req.Method)
+	fmt.Fprintf(w, "req.URL.Scheme: %s\n", req.URL.Scheme)
+	fmt.Fprintf(w, "req.URL.Opaque: %s\n", req.URL.Opaque)
+	fmt.Fprintf(w, "req.URL.Host: %s\n", req.URL.Host)
+	fmt.Fprintf(w, "req.URL.Path: %s\n", req.URL.Path)
+	fmt.Fprintf(w, "req.URL.RawPath: %s\n", req.URL.RawPath)
+	fmt.Fprintf(w, "req.URL.ForceQuery: %t\n", req.URL.ForceQuery)
+	fmt.Fprintf(w, "req.URL.RawQuery: %s\n", req.URL.RawQuery)
+	fmt.Fprintf(w, "req.URL.Fragment: %s\n", req.URL.Fragment)
+	fmt.Fprintf(w, "req.Proto: %s\n", req.Proto)
+	fmt.Fprintf(w, "req.ProtoMajor: %d\n", req.ProtoMajor)
+	fmt.Fprintf(w, "req.ProtoMinor: %d\n", req.ProtoMinor)
+
+	for key, val := range req.Header {
+		fmt.Fprintf(w, "req.Header[%s]: %s\n", key, val)
+	}
+
+	fmt.Fprintf(w, "req.ContentLength: %d\n", req.ContentLength)
+	fmt.Fprintf(w, "req.TransferEncoding: %s\n", req.TransferEncoding)
+
+	fmt.Fprintf(w, "req.Close: %t\n", req.Close)
+
+	fmt.Fprintf(w, "req.Host: %s\n", req.Host)
+	for key, val := range req.Form {
+		fmt.Fprintf(w, "req.Form[%s]: %s\n", key, val)
+	}
+
+	for key, val := range req.PostForm {
+		fmt.Fprintf(w, "req.PostForm[%s]: %s\n", key, val)
+	}
+
+	for key, val := range req.Trailer {
+		fmt.Fprintf(w, "req.Trailer[%s]: %s\n", key, val)
+	}
+
+	fmt.Fprintf(w, "req.RemoteAddr: %s\n", req.RemoteAddr)
+	fmt.Fprintf(w, "req.RequestURI: %s\n", req.RequestURI)
+
+}
+
+func dumpHTTPResponse(resp *http.Response, w io.Writer) {
+
+	const funcName = "dumpHTTPResponse"
+
+	fmt.Fprintf(w, "resp.Status: %s\n", resp.Status)
+	fmt.Fprintf(w, "resp.StatusCode: %d\n", resp.StatusCode)
+	fmt.Fprintf(w, "resp.Proto: %s\n", resp.Proto)
+
+	for key, val := range resp.Header {
+		fmt.Fprintf(w, "resp.Header[%s]: %s\n", key, val)
+	}
+
+	fmt.Fprintf(w, "resp.ContentLength: %d\n", resp.ContentLength)
+	fmt.Fprintf(w, "resp.TransferEncoding: %s\n", resp.TransferEncoding)
+
+	for key, val := range resp.Trailer {
+		fmt.Fprintf(w, "resp.Trailer[%s]: %s\n", key, val)
+	}
+
+}
+
+func stringBetween(s, prefix, postfix string) string {
+
+	const funcName = "stringBetween"
+
+	var prefixIndex int
+	prefixIndex = strings.Index(s, prefix)
+	if prefixIndex < 0 {
+		return ""
+	}
+
+	var dataIndex int
+	dataIndex = prefixIndex + len(prefix)
+
+	var postfixIndex int
+	postfixIndex = strings.Index(s, postfix)
+	if postfixIndex < 0 {
+		return ""
+	}
+
+	if postfixIndex > prefixIndex {
+		return s[dataIndex:postfixIndex]
+	}
+	return ""
+}
+
+func processArgs(ctx context.Context, args []string) (context.Context, error) {
+
+	const funcName = "processArgs"
+
+	var err error
+
+	var stringEndpoint string
+	var stringSoapAction string
+	var stringInfile string
+	var stringInfileTemplate string
+	var stringFlattenHTML string
+	var stringFlattenXML string
+	var stringFlattenKey string
+	var stringOutfile string
+	var stringBase64 string
+	var stringAuthtype string
+	var stringUsername string
+	var stringPassword string
+	var stringDebug string
+	var stringCpuProfile string
+	var stringMemProfile string
+
+	var usage string
+	usage = "\nusage: " + packageName + ` {name=value pairs}
+
+Options:
+endpoint={request url}
+soapaction={SOAP action in HTML header}
+infile={file that contains HTML request}
+infiletemplate={true|false}
+flattenHTML={true|false}
+flattenXML={true|false}
+flattenKey={flat key to search for}
+outfile={file to write HTML response}
+base64={true|false} perform base64 decrypt on output file
+Options for HTML Basic Authentication:
+authtype={basic} username={username} password={password}
+
+` + copyright + `
+`
+
+	// Process the command line args
+	for _, arg := range args {
+		var posEqual int
+		posEqual = strings.Index(arg, "=")
+		if posEqual < 0 {
+			return ctx, errors.New(packageName + ": " + funcName + ": args must be of format keyword=value")
+		}
+
+		var argKeyword string
+		var argValue string
+		argKeyword = arg[:posEqual]
+		argValue = arg[posEqual+1:]
+
+		// Process next arg
+		if arg == "help=y" {
+			return ctx, errors.New(usage)
+		} else if argKeyword == "endpoint" {
+			stringEndpoint = argValue
+		} else if argKeyword == "soapaction" {
+			stringSoapAction = argValue
+		} else if argKeyword == "infile" {
+			stringInfile = argValue
+		} else if argKeyword == "infiletemplate" {
+			stringInfileTemplate = argValue
+		} else if argKeyword == "flattenHTML" {
+			stringFlattenHTML = argValue
+		} else if argKeyword == "flattenXML" {
+			stringFlattenXML = argValue
+		} else if argKeyword == "flattenKey" {
+			stringFlattenKey = argValue
+		} else if argKeyword == "outfile" {
+			stringOutfile = argValue
+		} else if argKeyword == "base64" {
+			stringBase64 = argValue
+		} else if argKeyword == "authtype" {
+			stringAuthtype = argValue
+		} else if argKeyword == "username" {
+			stringUsername = argValue
+		} else if argKeyword == "password" {
+			stringPassword = argValue
+		} else if argKeyword == "debug" {
+			stringDebug = argValue
+		} else if argKeyword == "cpuprofile" {
+			stringCpuProfile = argValue
+		} else if argKeyword == "memprofile" {
+			stringMemProfile = argValue
+		} else {
+			return ctx, errors.New(packageName + ": " + funcName + ": unrecognized argKeyword: \"" + argKeyword + "\"")
+		}
+	}
+
+	if stringEndpoint == "" {
+		return ctx, errors.New(packageName + ": " + funcName + ": required: endpoint={request url}")
+	}
+
+	// Allowing reads from stdin now
+	// if stringInfile == "" {
+	// 	return ctx, errors.New(packageName + ": " + funcName + ": required: infile={file that contains HTML request}")
+	// }
+
+	var boolDebug bool = false
+	if stringDebug != "" {
+		boolDebug, err = strconv.ParseBool(stringDebug)
+		if err != nil {
+			return ctx, errors.New(packageName + ": " + funcName + ": optional: debug={true|false}")
+		}
+	}
+
+	var boolInfileTemplate bool = false
+	if stringInfileTemplate != "" {
+		boolInfileTemplate, err = strconv.ParseBool(stringInfileTemplate)
+		if err != nil {
+			return ctx, errors.New(packageName + ": " + funcName + ": optional: infiletemplate={true|false}")
+		}
+	}
+
+	var boolBase64 bool = false
+	if stringBase64 != "" {
+		boolBase64, err = strconv.ParseBool(stringBase64)
+		if err != nil {
+			return ctx, errors.New(packageName + ": " + funcName + ": optional: base64={true|false}")
+		}
+	}
+
+	var boolFlattenHTML bool = false
+	if stringFlattenHTML != "" {
+		boolFlattenHTML, err = strconv.ParseBool(stringFlattenHTML)
+		if err != nil {
+			return ctx, errors.New(packageName + ": " + funcName + ": optional: flattenHTML={true|false}")
+		}
+	}
+
+	var boolFlattenXML bool = false
+	if stringFlattenXML != "" {
+		boolFlattenXML, err = strconv.ParseBool(stringFlattenXML)
+		if err != nil {
+			return ctx, errors.New(packageName + ": " + funcName + ": optional: flattenXML={true|false}")
+		}
+	}
+
+	// save parameters
+	ctx = context.WithValue(ctx, "endpoint", stringEndpoint)
+	ctx = context.WithValue(ctx, "soapaction", stringSoapAction)
+	ctx = context.WithValue(ctx, "infile", stringInfile)
+	ctx = context.WithValue(ctx, "infiletemplate", boolInfileTemplate)
+	ctx = context.WithValue(ctx, "flattenHTML", boolFlattenHTML)
+	ctx = context.WithValue(ctx, "flattenXML", boolFlattenXML)
+	ctx = context.WithValue(ctx, "flattenKey", stringFlattenKey)
+	ctx = context.WithValue(ctx, "outfile", stringOutfile)
+	ctx = context.WithValue(ctx, "base64", boolBase64)
+	ctx = context.WithValue(ctx, "authtype", stringAuthtype)
+	ctx = context.WithValue(ctx, "username", stringUsername)
+	ctx = context.WithValue(ctx, "password", stringPassword)
+	ctx = context.WithValue(ctx, "debug", boolDebug)
+	ctx = context.WithValue(ctx, "cpuprofile", stringCpuProfile)
+	ctx = context.WithValue(ctx, "memprofile", stringMemProfile)
+
+	return ctx, nil
+}
+
+func flattenXml(outfile io.Writer, infile io.Reader, flattenKey string) error {
+
+	const funcName = "flattenXml"
+
+	var err error
+
+	var dec *xml.Decoder
+	dec = xml.NewDecoder(infile)
+	var stack []string // stack of element names
+
+	for {
+		var tok xml.Token
+		tok, err = dec.Token()
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		// fmt.Fprintf( stderr, "%T: %v\n", tok, tok )
+
+		switch tok := tok.(type) {
+		case xml.StartElement:
+			stack = append(stack, tok.Name.Local) // push
+			// fmt.Fprintf( stderr, "stack: %T, %v\n", stack, stack )
+		case xml.EndElement:
+			stack = stack[:len(stack)-1] //pop
+			// fmt.Fprintf( stderr, "stack: %T, %v\n", stack, stack )
+		case xml.CharData:
+			var thisKey string
+			var thisValue string
+			thisKey = "/" + strings.Join(stack, "/")
+			// fmt.Fprintf( stderr, "thisKey: %T, %v\n", thisKey, thisKey )
+			thisValue = strings.TrimSpace(string(tok))
+			// fmt.Fprintf( stderr, "thisValue: %T, %v\n", thisValue, thisValue )
+			if thisValue != "" {
+				// fmt.Fprintf( stderr, "thisValue: %T, %v\n", thisValue, thisValue )
+				switch {
+				case flattenKey == "":
+					{
+					// fmt.Fprintf(stderr,"flattenKey has length=0\n")
+					// fmt.Fprintf(stderr, thisKey+" "+thisValue+"\n")
+					fmt.Fprintf(outfile, thisKey+" "+thisValue+"\n")
+					}
+				case thisKey == flattenKey:
+					{
+					// fmt.Fprintf(stderr, thisValue+"\n")
+					fmt.Fprintf(outfile, thisValue+"\n")
+					}
+				case strings.HasSuffix( flattenKey, "/" ):
+					{
+					if strings.HasPrefix( thisValue, flattenKey ) {
+						// fmt.Fprintf(stderr, thisKey+" "+thisValue+"\n")
+						fmt.Fprintf(outfile, thisKey+" "+thisValue+"\n")
+					}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func flattenHtml(outfile io.Writer, infile io.Reader, flattenKey string) error {
+
+	const funcName = "flattenHtml"
+
+	var z *html.Tokenizer
+	z = html.NewTokenizer(infile)
+	var stack []string // stack of element names
+
+	for {
+		var tt html.TokenType
+		var token html.Token
+		tt = z.Next()
+		token = z.Token()
+		// fmt.Fprintf( os.Stderr, "Token: %T: %v\n", token, token )
+		// fmt.Fprintf( os.Stderr, "Type : %T: %v\n", token.Type, token.Type )
+		// fmt.Fprintf( os.Stderr, "Tag  : %T: %v\n", token.DataAtom.String(), token.DataAtom.String() )
+		// fmt.Fprintf( os.Stderr, "Data : %T: %v\n", string(token.Data), string(token.Data) )
+		// for i, attr := range token.Attr {
+		//	fmt.Fprintf( os.Stderr, "Attr %d: ns: %v, key: %v, value: %v\n", i, attr.Namespace, attr.Key, attr.Val)
+		// }
+
+		switch tt {
+		case html.ErrorToken:
+			if z.Err() == io.EOF {
+				return nil
+			} else {
+				return z.Err()
+			}
+		case html.StartTagToken:
+			stack = append(stack, token.DataAtom.String()) // push
+		case html.EndTagToken:
+			stack = stack[:len(stack)-1] //pop
+		case html.TextToken:
+			var thisKey string
+			var thisValue string
+			thisKey = "/" + strings.Join(stack, "/")
+			thisValue = strings.TrimSpace(string(token.Data))
+			if thisValue != "" {
+				if flattenKey != "" {
+					if thisKey == flattenKey {
+						fmt.Fprintf(outfile, thisValue+"\n")
+					}
+				} else {
+					fmt.Fprintf(outfile, thisKey+" "+thisValue+"\n")
+				}
+			}
+			// case html.SelfClosingTagToken:
+			// case html.CommentToken:
+			// case html.DoctypeToken:
+		}
+	}
+	return nil
+}
+
+func launch(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+
+	const funcName = "launch"
+
+	var err error
+
+	// fmt.Fprintf( stderr, "args: %v\n", args)
+	// fmt.Fprintf( stderr, "args: %V\n", args)
+	// fmt.Fprintf( stderr, "args: %T\n", args)
+
+	if len(args) < 1 {
+		return errors.New(packageName + ": " + funcName + ": must specify args of program to run")
+	}
+
+	var cmd *exec.Cmd
+	cmd = exec.Command(args[0], args[1:]...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	err = cmd.Start()
+	if err != nil {
+		return errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	err = cmd.Wait()
+	if err != nil {
+		return errors.New(packageName + ": " + funcName + ": " + err.Error())
+	}
+
+	return nil
+}
